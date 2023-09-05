@@ -1,0 +1,15 @@
+#!/bin/sh
+
+export LC_ALL=C
+
+if [ "$2" = "down" ]; then
+  /sbin/ip route ls | grep -q '^default' || {
+    [ -f /run/ddclient/ddclient.pid ] && /usr/bin/systemctl stop ddclient.service || :
+  } && { :; }
+fi
+
+if [ "$2" = "up" ]; then
+  /sbin/ip -o route show dev "$1" | grep -q '^default' && {
+    /usr/bin/systemctl is-enabled ddclient >/dev/null && /usr/bin/systemctl start ddclient.service || :
+  } || { :; }
+fi

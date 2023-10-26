@@ -3,7 +3,15 @@
 This document describes notable changes. For details, see the [source code
 repository history](https://github.com/ddclient/ddclient/commits/master).
 
-## 20XX-XX-XX v3.11.1_0 (WIP)
+## 20XX-XX-XX v3.11.2_0 (WIP)
+
+## 2023-10-25 v3.11.1
+
+### Bug fixes
+  * Fixed simultaneous IPv4 and IPv6 updates for provider porkbun
+  * Removed @PACKAGE_VERSION@ placeholder in ddclient.in for now
+    to allow downstream to adopt the proper build process first.
+    See [here](https://github.com/ddclient/ddclient/issues/579) for the discussion.
 
 ## 2023-10-21 v3.11.0
 This version is the same as v3.11.0_1 (except for the updated version number in the code).

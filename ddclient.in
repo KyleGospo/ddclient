@@ -125,6 +125,7 @@ if ($program =~ /test/i) {
     $cachedir = '.';
     $savedir = 'URL';
 }
+our @curl = (subst_var('@CURL@', 'curl'));
 
 our $emailbody = '';
 my $last_emailbody = '';
@@ -2635,7 +2636,7 @@ sub curl_cmd {
     my @params = @_;
     my $tmpfile;
     my $tfh;
-    my $system_curl = quotemeta(subst_var('@CURL@', 'curl'));
+    my $curl = join(' ', @curl);
     my %curl_codes = (  ## Subset of error codes from https://curl.haxx.se/docs/manpage.html
          2 => "Failed to initialize. (Most likely a bug in ddclient, please open issue at https://github.com/ddclient/ddclient)",
          3 => "URL malformed. The syntax was not correct",
@@ -2653,11 +2654,11 @@ sub curl_cmd {
         67 => "The user name, password, or similar was not accepted and curl failed to log in.",
         77 => "Problem with reading the SSL CA cert (path? access rights?).",
         78 => "The resource referenced in the URL does not exist.",
-       127 => "$system_curl was not found",
+       127 => "$curl was not found",
     );
 
-    debug("CURL: %s", $system_curl);
-    fatal("curl not found") if ($system_curl eq '');
+    debug("CURL: %s", $curl);
+    fatal("curl not found") if ($curl[0] eq '');
     return '' if (scalar(@params) == 0); ## no parameters provided
 
     # Hard code to /tmp rather than use system TMPDIR to protect from malicious
@@ -2673,9 +2674,20 @@ sub curl_cmd {
         print($tfh @params);
     }
     close($tfh);
-    my $reply = qx{ $system_curl --config $tmpfile 2>/dev/null; };
+    # Use open's list form (as opposed to qx, backticks, or the scalar form of open) to avoid the
+    # shell and reduce the risk of a shell injection vulnerability.  ':raw' mode is used because
+    # HTTP is defined in terms of octets (bytes), not characters.  In raw mode, each byte from curl
+    # is mapped to a same-valued codepoint (byte value 0x78 becomes character U+0078, 0xff becomes
+    # U+00ff).  The caller is responsible for decoding the byte sequence if necessary.
+    open(my $cfh, '-|:raw', @curl, '--config', $tmpfile)
+        or fatal("failed to run curl ($curl): $!");
+    # According to <https://perldoc.perl.org/PerlIO#Alternatives-to-raw>, adding ':raw' to the open
+    # mode is buggy with Perl < v5.14.  Call binmode on the filehandle just in case.
+    binmode($cfh) or fatal("binmode failed: $!");
+    my $reply = do { local $/; <$cfh>; };
+    close($cfh);  # Closing $cfh waits for the process to exit and sets $?.
     if ((my $rc = $?>>8) != 0) {
-        warning("CURL error (%d) %s", $rc, $curl_codes{$rc} // "Unknown return code. Check $system_curl is installed and its manpage.");
+        warning("CURL error (%d) %s", $rc, $curl_codes{$rc} // "Unknown return code. Check $curl is installed and its manpage.");
     }
     return $reply;
 }
@@ -4140,6 +4152,8 @@ o 'dnsexit2'
 
 The 'dnsexit2' protocol is the updated protocol for the (free) dynamic hostname services
 of 'DNSExit' (www.dnsexit.com). Their API is accepting JSON payload.
+Note that we only update the record, it must already exist in the DNSExit system
+(A and/or AAAA records where applicable).
 
 Configuration variables applicable to the 'dnsexit2' protocol are:
   protocol=dnsexit2         ##
@@ -4173,99 +4187,113 @@ EoEXAMPLE
 ######################################################################
 sub nic_dnsexit2_update {
     debug("\nnic_dnsexit2_update -------------------");
-
-    # The DNSExit API does not support updating multiple hosts at a time.
+    # The DNSExit API does not support updating hosts with different zones at the same time,
+    # handling update per host.
     for my $h (@_) {
         $config{$h}{'zone'} //= $h;
-        # The IPv4 and IPv6 addresses must be updated together in a single API call.
-        my %ips;
-        my @updates;
-        for my $ipv ('4', '6') {
-            my $ip = delete($config{$h}{"wantipv$ipv"}) or next;
-            $ips{$ipv} = $ip;
-            info("Going to update IPv%s address to %s for %s.", $ipv, $ip, $h);
-            $config{$h}{"status-ipv$ipv"} = 'failed';
-            push(@updates, {
-                name => $h,
-                type => ($ipv eq '6') ? 'AAAA' : 'A',
-                content => $ip,
-                ttl => $config{$h}{'ttl'},
-            });
-        };
-        my $url = $config{$h}{'server'} . $config{$h}{'path'};
-        my $reply = geturl(
-            proxy => opt('proxy'),
-            url => $url,
-            headers => "Content-Type: application/json\nAccept: application/json",
-            method => 'POST',
-            data => encode_json({
-                apikey => $config{$h}{'password'},
-                domain => $config{$h}{'zone'},
-                update => \@updates,
-            }),
-        );
-        unless ($reply && header_ok($h, $reply)) {
-            failed("updating %s: Could not connect to %s", $h, $url);
-            last;
-        };
-        debug("%s", $reply);
-        (my $http_status) = ($reply =~ m%^s*HTTP/.*\s+(\d+)%i);
-        debug("HTTP response code: %s", $http_status);
-        if ($http_status ne '200') {
-            failed("Failed to update Host\n%s", $h);
-            failed("HTTP response code\n%s", $http_status);
-            failed("Full reply\n%s", $reply) unless opt('verbose');
-            next;
+        dnsexit2_update_host($h);
+    }
+}
+
+sub dnsexit2_update_host {
+    my ($h) = @_;
+    my $name = $h;
+    # Remove the zone suffix from $name.  If the zone eq $name, $name can be left alone or
+    # set to the empty string; both have identical semantics.  For consistency, always
+    # remove the zone even if it means $name becomes the empty string.
+    if ($name =~ s/(?:^|\.)\Q$config{$h}{'zone'}\E$//) {
+        # The zone was successfully trimmed from $name.
+    } else {
+        fatal("Hostname %s does not end with the zone %s", $h, $config{$h}{'zone'});
+    }
+    # The IPv4 and IPv6 addresses must be updated together in a single API call.
+    my %ips;
+    my @updates;
+    for my $ipv ('4', '6') {
+        my $ip = delete($config{$h}{"wantipv$ipv"}) or next;
+        $ips{$ipv} = $ip;
+        info("Going to update IPv%s address to %s for %s.", $ipv, $ip, $h);
+        $config{$h}{"status-ipv$ipv"} = 'failed';
+        push(@updates, {
+            name => $name,
+            type => ($ipv eq '6') ? 'AAAA' : 'A',
+            content => $ip,
+            ttl => $config{$h}{'ttl'},
+        });
+    };
+    my $url = $config{$h}{'server'} . $config{$h}{'path'};
+    my $reply = geturl(
+        proxy => opt('proxy'),
+        url => $url,
+        headers => "Content-Type: application/json\nAccept: application/json",
+        method => 'POST',
+        data => encode_json({
+            apikey => $config{$h}{'password'},
+            domain => $config{$h}{'zone'},
+            update => \@updates,
+        }),
+    );
+    unless ($reply && header_ok($h, $reply)) {
+        failed("updating %s: Could not connect to %s", $h, $url);
+        return;
+    };
+    debug("%s", $reply);
+    (my $http_status) = ($reply =~ m%^s*HTTP/.*\s+(\d+)%i);
+    debug("HTTP response code: %s", $http_status);
+    if ($http_status ne '200') {
+        failed("Failed to update Host\n%s", $h);
+        failed("HTTP response code\n%s", $http_status);
+        failed("Full reply\n%s", $reply) unless opt('verbose');
+        return;
+    }
+    my $body = ($reply =~ s/^.*?\r?\n\r?\n//sr);
+    my $response = eval { decode_json($body); };
+    if (!$response) {
+        failed("failed to parse response: $@");
+        return;
+    }
+    if (!defined($response->{'code'}) || !defined($response->{'message'})) {
+        failed("Did not receive expected 'code' and 'message' keys in server response:\n%s",
+               $body);
+        return;
+    }
+    my %codemeaning = (
+        '0' => ['good', 'Success! Actions got executed successfully.'],
+        '1' => ['warning', 'Some execution problems. May not indicate actions failures. Some action may got executed fine and some may have problems.'],
+        '2' => ['badauth', 'API Key Authentication Error. The API Key is missing or wrong.'],
+        '3' => ['error', 'Missing Required Definitions. Your JSON file may missing some required definitions.'],
+        '4' => ['error', 'JSON Data Syntax Error. Your JSON file has syntax error.'],
+        '5' => ['error', 'JSON Defined Record Type not Supported. Your JSON may try to update some record type not supported by our system.'],
+        '6' => ['error', 'System Error. Our system problem. May not be your problem. Contact our support if you got such error.'],
+        '7' => ['error', 'Error getting post data. Our server has problem to receive your JSON posting.'],
+    );
+    if (!exists($codemeaning{$response->{'code'}})) {
+        failed("Status code %s is unknown!", $response->{'code'});
+        return;
+    }
+    my ($status, $message) = @{$codemeaning{$response->{'code'}}};
+    info("Status: %s -- Message: %s", $status, $message);
+    info("Server Message: %s -- Server Details: %s", $response->{'message'},
+         defined($response->{'details'}) ? $response->{'details'}[0] : "no details received");
+    if ($status ne 'good') {
+        if ($status eq 'warning') {
+            warning("%s", $message);
+            warning("Server response: %s", $response->{'message'});
+        } elsif ($status =~ m'^(badauth|error)$') {
+            failed("%s", $message);
+            failed("Server response: %s", $response->{'message'});
+        } else {
+            failed("Unexpected status: %s", $status);
         }
-        my $body = ($reply =~ s/^.*?\r?\n\r?\n//sr);
-        my $response = eval { decode_json($body); };
-        if (!$response) {
-            failed("failed to parse response: $@");
-            next;
-        }
-        if (!defined($response->{'code'}) || !defined($response->{'message'})) {
-            failed("Did not receive expected 'code' and 'message' keys in server response:\n%s",
-                $body);
-            next;
-        }
-        my %codemeaning = (
-            '0' => ['good', 'Success! Actions got executed successfully.'],
-            '1' => ['warning', 'Some execution problems. May not indicate actions failures. Some action may got executed fine and some may have problems.'],
-            '2' => ['badauth', 'API Key Authentication Error. The API Key is missing or wrong.'],
-            '3' => ['error', 'Missing Required Definitions. Your JSON file may missing some required definitions.'],
-            '4' => ['error', 'JSON Data Syntax Error. Your JSON file has syntax error.'],
-            '5' => ['error', 'JSON Defined Record Type not Supported. Your JSON may try to update some record type not supported by our system.'],
-            '6' => ['error', 'System Error. Our system problem. May not be your problem. Contact our support if you got such error.'],
-            '7' => ['error', 'Error getting post data. Our server has problem to receive your JSON posting.'],
-        );
-        if (!exists($codemeaning{$response->{'code'}})) {
-            failed("Status code %s is unknown!", $response->{'code'});
-            next;
-        }
-        my ($status, $message) = @{$codemeaning{$response->{'code'}}};
-        info("Status: %s -- Message: %s", $status, $message);
-        info("Server Message: %s -- Server Details: %s", $response->{'message'},
-             defined($response->{'details'}) ? $response->{'details'}[0] : "no details received");
-        if ($status ne 'good') {
-            if ($status eq 'warning') {
-                warning("%s", $message);
-                warning("Server response: %s", $response->{'message'});
-            } elsif ($status =~ m'^(badauth|error)$') {
-                failed("%s", $message);
-                failed("Server response: %s", $response->{'message'});
-            } else {
-                failed("Unexpected status: %s", $status);
-            }
-            next;
-        }
-        success("%s", $message);
-        $config{$h}{'mtime'} = $now;
-        keys(%ips);  # Reset internal iterator.
-        while (my ($ipv, $ip) = each(%ips)) {
-            $config{$h}{"ipv$ipv"} = $ip;
-            $config{$h}{"status-ipv$ipv"} = 'good';
-            success("Updated %s successfully to IPv%s address %s at time %s", $h, $ipv, $ip, prettytime($config{$h}{'mtime'}));
-        }
+        return;
+    }
+    success("%s", $message);
+    $config{$h}{'mtime'} = $now;
+    keys(%ips);  # Reset internal iterator.
+    while (my ($ipv, $ip) = each(%ips)) {
+        $config{$h}{"ipv$ipv"} = $ip;
+        $config{$h}{"status-ipv$ipv"} = 'good';
+        success("Updated %s successfully to IPv%s address %s at time %s", $h, $ipv, $ip, prettytime($config{$h}{'mtime'}));
     }
 }
 

@@ -2600,33 +2600,22 @@ sub encode_base64 ($;$) {
 ## load_sha1_support
 ######################################################################
 sub load_sha1_support {
-    my $why         = shift;
-    my $sha1_loaded = eval { require Digest::SHA1 };
-    my $sha_loaded  = eval { require Digest::SHA };
-    unless ($sha1_loaded || $sha_loaded) {
-        fatal("%s", <<"EOM");
-Error loading the Perl module Digest::SHA1 or Digest::SHA needed for $why update.
-On Debian, the package libdigest-sha1-perl or libdigest-sha-perl must be installed.
+    my ($protocol) = @_;
+    eval { require Digest::SHA; } or fatal(<<"EOM");
+Error loading the Perl module Digest::SHA needed for $protocol update.
+On Debian, the package libdigest-sha-perl must be installed.
 EOM
-    }
-    if ($sha1_loaded) {
-        import Digest::SHA1 (qw/sha1_hex/);
-    } elsif ($sha_loaded) {
-        import Digest::SHA (qw/sha1_hex/);
-    }
+    Digest::SHA->import(qw/sha1_hex/);
 }
+
 ######################################################################
 ## load_json_support
 ######################################################################
 sub load_json_support {
-    my $why = shift;
-    my $json_loaded = eval { require JSON::PP };
-    unless ($json_loaded) {
-        fatal("%s", <<"EOM");
-Error loading the Perl module JSON::PP needed for $why update.
-EOM
-    }
-    import JSON::PP (qw/decode_json encode_json/);
+    my ($protocol) = @_;
+    eval { require JSON::PP; }
+        or fatal("Error loading the Perl module JSON::PP needed for $protocol update.");
+    JSON::PP->import(qw/decode_json encode_json/);
 }
 
 ######################################################################
@@ -3785,24 +3774,20 @@ sub nic_updateable {
 ######################################################################
 sub header_ok {
     my ($host, $line) = @_;
-    my $ok = 0;
-
-    if ($line =~ m%^s*HTTP/.*\s+(\d+)%i) {
-        my $result = $1;
-
-        if ($result =~ m/^2\d\d$/) {
-            $ok = 1;
-
-        } elsif ($result eq '401') {
-            failed("updating %s: authentication failed (%s)", $host, $line);
-        } elsif ($result eq '403') {
-            failed("updating %s: not authorized (%s)", $host, $line);
-        }
-
-    } else {
-        failed("updating %s: unexpected line (%s)", $host, $line);
+    $line =~ s/\r?\n.*//s;
+    my ($code, $msg) = ($line =~ qr%^\s*HTTP/.*\s+(\d+)\s*(?:\s+([^\s].*))?$%i);
+    if (!defined($code)) {
+        failed('updating %s: unexpected HTTP response: %s', $host, $line);
+        return 0;
+    } elsif ($code !~ qr/^2\d\d$/) {
+        my %msgs = (
+            '401' => 'authentication failed',
+            '403' => 'not authorized',
+        );
+        failed('updating %s: %s %s', $host, $code, $msg // $msgs{$code} // '');
+        return 0;
     }
-    return $ok;
+    return 1;
 }
 
 ######################################################################

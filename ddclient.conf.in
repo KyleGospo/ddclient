@@ -16,13 +16,16 @@
 ##          are mentioned here.
 ##
 ######################################################################
+
+## Use encryption (TLS) when the scheme (either "http://" or "https://") is
+## missing from a URL.  Defaults to "yes".
+#ssl=yes
+
 daemon=300				# check every 300 seconds
 syslog=yes				# log update msgs to syslog
 mail=root				# mail all msgs to root
 mail-failure=root		# mail failed update msgs to root
 pid=@runstatedir@/ddclient.pid		# record PID in file.
-ssl=yes					# use ssl-support.  Works with
-						# ssl-library
 # postscript=script		# run script after updating.  The
 						# new IP is added as argument.
 #
@@ -246,6 +249,14 @@ ssl=yes					# use ssl-support.  Works with
 # myhost
 
 ##
+## DDNS.FM (https://ddns.fm/)
+##
+#
+# protocol=ddns.fm,
+# password=my-token
+# myhost.example.com
+
+##
 ## MyOnlinePortal (http://myonlineportal.net)
 ##
 # # ipv6=yes # optional
@@ -404,3 +415,12 @@ ssl=yes					# use ssl-support.  Works with
 ##
 # protocol=emailonly
 # host.example.com
+
+##
+## dnsHome.de
+##
+# protocol=dyndns2           \
+# server=www.dnshome.de      \
+# login=subdomain.domain.tld \
+# password=your_password     \
+# subdomain.domain.tld
